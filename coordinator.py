@@ -1,6 +1,6 @@
 """
 Interacts with hashring to find replicas/nodes for get/post requests
-Calls utils's helper get and post methods that requests to running local node instances.
+Calls utils's helper get and post methods that requests to running local node instances (server.py).
 
 (1) coordinator -> (2) hash_ring to find replica/node -> (3) utils -> (4) server
 (2) - for post we require only 1 node and then replication can be performed.
@@ -11,11 +11,17 @@ Calls utils's helper get and post methods that requests to running local node in
 # uvicorn cache_logic.server:app --port 8002  - node 2 at localhost:8002
 # uvicorn cache_logic.server:app --port 8003  - node 3 at localhost:8003
 
+-- for running on local machine, coordinator runs on localhost:8000
 curl -X POST "http://127.0.0.1:8000/set" \
      -H "Content-Type: application/json" \
-     -d '{"key": "user123", "value": "Alice"}'
+     -d '{"key": "user123", "value": "Alice"}'  
 
 curl -X GET "http://127.0.0.1:8000/get/user123"
+
+-- for running inside container use
+curl -X POST "http://localhost:8000/set" \
+     -H "Content-Type: application/json" \
+     -d '{"key":"user123","value":"Alice"}'
 """ 
 # # curl "localhost:8000/get/foo"
 from fastapi import FastAPI
@@ -23,7 +29,14 @@ from pydantic import BaseModel
 from cache_logic.consistent_hashing import HashRing
 from cache_logic.config import NODES, REPLICATION_FACTOR, VIRTUAL_NODES
 from cache_logic.utils import post, get
+import logging
 import threading
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)-8s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("coordinator")
 
 app = FastAPI()
 ring = HashRing(NODES, vnodes=VIRTUAL_NODES)
@@ -58,12 +71,12 @@ def set_item(item: Item):
         if response and response.ok:
             # replicate asynchronously
             replicate_async(item.key, item.value, item.ttl, replicas)
-            print(f"[SET] Key={item.key} → Primary={primary_node}, Replicas={replicas}")
+            logging.info(f"[SET] Key : {item.key} → Primary Node : {primary_node}")
             return {"status": "stored", "primary": primary_node, "replicas": replicas}
         else:
             print(f"[SET] Key={item.key} FAILED")
     except Exception as e:
-        print(f"Error writing to {primary_node}: {e}")
+        logger.error(f"Error writing to {primary_node}: {e}")
         return {"error": "Failed to contact primary"}
 
 @app.get("/get/{key}")
@@ -75,6 +88,6 @@ def get_item(key: str):
         if res and res.ok and "value" in res.json():
             val = res.json().get("value")
             if val:
-                print(f"[GET] Key={key} from {node}")
+                logger.info(f"[GET] Key={key} from Node : {node}")
                 return {"value": val, "source": node}
     return {"error": "Not found"}

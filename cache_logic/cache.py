@@ -24,7 +24,7 @@ import time
 
 logging.basicConfig(
     level=logging.INFO,  # Change to DEBUG for more verbosity
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    format="%(levelname)-8s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("cache-node")
 
@@ -122,6 +122,7 @@ class Cache:
         """
         Helper method to delete expired keys using a worker thread
         """
+        logger.info("Running cleaner job to expire expired keys.")
         while True:
             time.sleep(1)
             now = time.time()

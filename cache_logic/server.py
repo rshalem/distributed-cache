@@ -1,5 +1,5 @@
 """
-Each node will have this code
+Each node will have this code, it can be ran in a designated port via uvicorn
 Stores and retrives data from its local cache using Cache class
 Replies back to coordinator with results
 """

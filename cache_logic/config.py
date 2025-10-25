@@ -1,9 +1,10 @@
 # config.py
+# http://node1:8001 - inside container, hostname is resolved as service name
+# if run locally, replace it with localhost:port
 NODES = [
-    "http://127.0.0.1:8001",
-    "http://127.0.0.1:8002",
-    "http://127.0.0.1:8003",
-    "http://127.0.0.1:8004",
+    "http://node1:8001",
+    "http://node2:8002",
+    "http://node3:8003",
 ]
 
 REPLICATION_FACTOR = 3

@@ -5,7 +5,7 @@ from cache_logic.config import VIRTUAL_NODES, REPLICATION_FACTOR
 
 logging.basicConfig(
     level=logging.INFO,  # Change to DEBUG for more verbosity
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    format="%(levelname)-8s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("hash-ring")
 
@@ -54,9 +54,9 @@ class HashRing:
         replicas = []
         i = 0
         while len(replicas) < replication_factor and i < len(self.sorted_keys):
-            hash_ring_vnode = self.sorted_keys[(start_idx + i) % len(self.sorted_keys)] # always wrap around if i becomes >
+            hash_ring_vnode = self.sorted_keys[(start_idx + i) % len(self.sorted_keys)] # always wrap around if start_idx becomes > to run clockwise
             actual_node_where_key_stored = self.ring[hash_ring_vnode] # gives actual node like nodeA from a vnode of nodeA
-            if actual_node_where_key_stored not in replicas:
+            if actual_node_where_key_stored not in replicas: # not costly as only 3 replicas will be there at max
                 replicas.append(actual_node_where_key_stored)
             i += 1
         logger.info(f"replicas for key: {key} are: {replicas}")
