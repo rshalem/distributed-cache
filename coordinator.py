@@ -1,93 +1,104 @@
 """
-Interacts with hashring to find replicas/nodes for get/post requests
-Calls utils's helper get and post methods that requests to running local node instances (server.py).
+Stateless coordinator. Routes each request to the right cache nodes using
+the consistent hash ring.
 
-(1) coordinator -> (2) hash_ring to find replica/node -> (3) utils -> (4) server
-(2) - for post we require only 1 node and then replication can be performed.
-  - for get we require all replicas/nodes to search the key into
+Write path: try replicas in ring order; the first node that accepts the
+write acts as primary (so a dead primary fails over to the next replica),
+then the remaining replicas are updated asynchronously.
 
-# uvicorn coordinator:app --port 8000   - runs coordinator.py
-# uvicorn cache_logic.server:app --port 8001  - node 1 at localhost:8001
-# uvicorn cache_logic.server:app --port 8002  - node 2 at localhost:8002
-# uvicorn cache_logic.server:app --port 8003  - node 3 at localhost:8003
+Read path: try replicas in ring order and return the first hit; a node
+that is down or times out is skipped.
 
--- for running on local machine, coordinator runs on localhost:8000
-curl -X POST "http://127.0.0.1:8000/set" \
-     -H "Content-Type: application/json" \
-     -d '{"key": "user123", "value": "Alice"}'  
+Run with Docker Compose:   docker compose up --build
+Run locally:               see README.md
 
-curl -X GET "http://127.0.0.1:8000/get/user123"
-
--- for running inside container use
-curl -X POST "http://localhost:8000/set" \
-     -H "Content-Type: application/json" \
-     -d '{"key":"user123","value":"Alice"}'
-""" 
-# # curl "localhost:8000/get/foo"
-from fastapi import FastAPI
-from pydantic import BaseModel
-from cache_logic.consistent_hashing import HashRing
-from cache_logic.config import NODES, REPLICATION_FACTOR, VIRTUAL_NODES
-from cache_logic.utils import post, get
+curl -X POST localhost:8000/set -H "Content-Type: application/json" \
+     -d '{"key": "user123", "value": "Alice", "ttl": 60}'
+curl localhost:8000/get/user123
+curl -X DELETE localhost:8000/delete/user123
+"""
 import logging
-import threading
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(levelname)-8s | %(name)s | %(message)s",
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+from cache_logic.config import (
+    DEFAULT_TTL,
+    LOG_ENDPOINT_URL,
+    NODES,
+    REPLICATION_FACTOR,
+    VIRTUAL_NODES,
 )
+from cache_logic.consistent_hashing import HashRing
+from cache_logic.replication import replicate_async
+from cache_logic.utils import delete, get, post
+from log_logic.log_handler import HttpLogHandler
+
 logger = logging.getLogger("coordinator")
+logger.setLevel(logging.INFO)
+logger.addHandler(HttpLogHandler(LOG_ENDPOINT_URL, "coordinator"))
 
 app = FastAPI()
 ring = HashRing(NODES, vnodes=VIRTUAL_NODES)
 
+
 class Item(BaseModel):
     key: str
     value: str
-    ttl: int = 60
+    ttl: int = DEFAULT_TTL
 
-def replicate_async(key: str, value: str, ttl: int, replicas: list):
-    """Asynchronous background replication
-    achieving eventual consistency
-    """
-    for node in replicas[1:]: #rest of the replica node after primary node, 2 threads spinned
-        threading.Thread(
-            target=post,
-            args=(f"{node}/set", {"key": key, "value": value, "ttl": ttl}),
-            daemon=True
-        ).start()
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "nodes": NODES, "replication_factor": REPLICATION_FACTOR}
+
 
 @app.post("/set")
 def set_item(item: Item):
-    # get the replicas, and pick the 1st one [0]
-    # send a post request to that node to be stored.
-    # then sync to rest of the replicas[1:]
     replicas = ring.get_replicas(item.key, replication_factor=REPLICATION_FACTOR)
-    primary_node = replicas[0]
-    print(f"node where key is to be set: {primary_node}")
-    try:
-        url = f"{primary_node}/set"
-        response = post(url, item.dict())
-        if response and response.ok:
-            # replicate asynchronously
-            replicate_async(item.key, item.value, item.ttl, replicas)
-            logging.info(f"[SET] Key : {item.key} → Primary Node : {primary_node}")
-            return {"status": "stored", "primary": primary_node, "replicas": replicas}
-        else:
-            print(f"[SET] Key={item.key} FAILED")
-    except Exception as e:
-        logger.error(f"Error writing to {primary_node}: {e}")
-        return {"error": "Failed to contact primary"}
+    payload = item.model_dump()
+
+    for i, node in enumerate(replicas):
+        res = post(f"{node}/set", payload)
+        if res is not None and res.ok:
+            if i > 0:
+                logger.warning(f"[SET] key='{item.key}' failed over to {node}")
+            others = [n for n in replicas if n != node]
+            replicate_async(payload, others)
+            logger.info(f"[SET] key='{item.key}' primary={node}")
+            return {"status": "stored", "primary": node, "replicas": replicas}
+        logger.warning(f"[SET] key='{item.key}' write to {node} failed, trying next replica")
+
+    logger.error(f"[SET] key='{item.key}' failed on all replicas {replicas}")
+    raise HTTPException(status_code=503, detail="No replica available")
+
 
 @app.get("/get/{key}")
 def get_item(key: str):
     replicas = ring.get_replicas(key, replication_factor=REPLICATION_FACTOR)
+    reachable = 0
+
     for node in replicas:
-        url = f"{node}/get/{key}"
-        res = get(url)
-        if res and res.ok and "value" in res.json():
-            val = res.json().get("value")
-            if val:
-                logger.info(f"[GET] Key={key} from Node : {node}")
-                return {"value": val, "source": node}
-    return {"error": "Not found"}
+        res = get(f"{node}/get/{key}")
+        if res is None:
+            logger.warning(f"[GET] key='{key}' node {node} unreachable, trying next replica")
+            continue
+        reachable += 1
+        if res.ok:
+            logger.info(f"[GET] key='{key}' hit on {node}")
+            return {"value": res.json()["value"], "source": node}
+
+    if reachable == 0:
+        raise HTTPException(status_code=503, detail="No replica available")
+    raise HTTPException(status_code=404, detail="Not found")
+
+
+@app.delete("/delete/{key}")
+def delete_item(key: str):
+    replicas = ring.get_replicas(key, replication_factor=REPLICATION_FACTOR)
+    results = {}
+    for node in replicas:
+        res = delete(f"{node}/delete/{key}")
+        results[node] = "ok" if res is not None and res.ok else "unreachable"
+    logger.info(f"[DELETE] key='{key}' {results}")
+    return {"status": "deleted", "replicas": results}

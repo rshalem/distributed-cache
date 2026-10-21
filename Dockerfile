@@ -1,10 +1,21 @@
-# docker run -p local_port:container_port image_name
 FROM python:3.10-slim
-# This makes /app the default folder inside the container where all commands and files run.
-# So when you copy or run anything next, it happens inside /app.
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
-COPY . /app
+
+# Install dependencies first so this layer is cached across code changes.
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-# Tells Docker that this container will listen on port 8001 (your node’s API).
-EXPOSE 8001
-CMD ["uvicorn", "cache_logic.server:app", "--host", "0.0.0.0", "--port", "8001"]
+
+COPY . .
+
+# Run as an unprivileged user (CIS Docker benchmark 4.1).
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /app/logs \
+    && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8000
+CMD ["uvicorn", "coordinator:app", "--host", "0.0.0.0", "--port", "8000"]

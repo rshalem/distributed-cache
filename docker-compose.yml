@@ -1,9 +1,7 @@
-# Each block under services: defines one container to run.
-# command param overrides the CMD in Dockerfile
-# All on the same internal network → so coordinator can reach them via
-# http://node1:8001, http://node2:8002, etc.
+# One image, five containers. Each service overrides the Dockerfile CMD.
+# All services share the default Compose network, so they reach each
+# other by service name (http://node1:8001, http://log:9000, ...).
 
-version: "3.9"
 services:
   node1:
     build: .
@@ -11,6 +9,7 @@ services:
     ports:
       - "8001:8001"
     command: ["uvicorn", "cache_logic.server:app", "--host", "0.0.0.0", "--port", "8001"]
+
   node2:
     build: .
     container_name: node2
@@ -25,13 +24,29 @@ services:
       - "8003:8003"
     command: ["uvicorn", "cache_logic.server:app", "--host", "0.0.0.0", "--port", "8003"]
 
+  log:
+    build: .
+    container_name: log
+    ports:
+      - "9000:9000"
+    environment:
+      LOG_FILE: /app/logs/central.log
+    volumes:
+      - ./logs:/app/logs
+    command: ["uvicorn", "log_logic.log_collector:app", "--host", "0.0.0.0", "--port", "9000"]
+
   coordinator:
     build: .
     container_name: coordinator
     ports:
       - "8000:8000"
+    environment:
+      CACHE_NODES: http://node1:8001,http://node2:8002,http://node3:8003
+      REPLICATION_FACTOR: "2"
+      LOG_ENDPOINT_URL: http://log:9000/log
     command: ["uvicorn", "coordinator:app", "--host", "0.0.0.0", "--port", "8000"]
     depends_on:
       - node1
       - node2
       - node3
+      - log

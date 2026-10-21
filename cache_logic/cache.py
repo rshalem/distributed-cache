@@ -1,133 +1,138 @@
 """
-threading will help me create a sub thread from main thread
-that would run a cleanup task for deleting cache which reaches ttl
+Thread-safe LRU cache with per-key TTL.
 
-If you dont use threading, the main process (the one running FastAPI or the CLI) would block,
-youd either have to manually call a cleanup function or let the cache leak memory indefinitely.
-
-The cache object (self.cache, self.ttl_map) lives in Python memory.
-Threads in the same process share memory, so the cleaner thread can directly access and modify those dictionaries.
-
-when main thread is having a get operation on a key, and at the same time worker thread is running cleanup ttl task for same key
-then it might cause inconsistency, hence we do self.lock to ensure main thread first completes it operation and then
-allow others to execute
-
-main thread
-|
-| -> sub thread
-|
-
+- Hash map (key -> Node) gives O(1) lookup.
+- Doubly linked list keeps recency order: most recently used right after
+  `head`, least recently used right before `tail`. Move-to-front and
+  evict-from-tail are both O(1).
+- A background daemon thread wakes every second and removes expired keys.
+  Expired keys are also removed lazily on `get`.
+- One lock guards all state. It is NOT re-entrant, so internal helpers
+  (`_delete_unlocked`, `_remove`, `_insert`) assume the caller holds it.
 """
 import logging
 import threading
 import time
 
 logging.basicConfig(
-    level=logging.INFO,  # Change to DEBUG for more verbosity
+    level=logging.INFO,
     format="%(levelname)-8s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("cache-node")
 
+
 class Node:
-    # doubly linked list
+    """Doubly linked list node."""
+
     def __init__(self, key, value):
-        self.key=key
-        self.value=value
-        self.next=self.prev=None
+        self.key = key
+        self.value = value
+        self.prev = None
+        self.next = None
+
 
 class Cache:
-    def __init__(self, capacity=500):
-        self.capacity = capacity # upper limit for nodes
-        self.current_cache_size = 0 # for tracking real time node count
-        self.cache = {} # will store key and value as node
-        self.ttl_map = {} # will store key and their ttl
-        self.lock = threading.Lock() # only one thread at a time can execute any code inside this block”
-        # While one thread holds the lock, all other threads trying to acquire it must wait until it’s released.
-        threading.Thread(target=self._cleaner, daemon=True).start() # creates worker thread and runs sef._cleaner method.
-        
-        self.head, self.tail = Node(0,0), Node(0,0) # dummy head and tail for ease
+    def __init__(self, capacity=500, cleanup_interval=1.0):
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        self.capacity = capacity
+        self.cache = {}    # key -> Node
+        self.ttl_map = {}  # key -> absolute expiry time (only keys with a TTL)
+        self.lock = threading.Lock()
+        self.cleanup_interval = cleanup_interval
+
+        # Dummy head/tail so insert/remove never deal with None neighbours.
+        self.head, self.tail = Node(None, None), Node(None, None)
         self.head.next = self.tail
         self.tail.prev = self.head
-    
-    def set(self, key, value, ttl=None):
-        # only one thread at a time can execute any code inside this block
-        with self.lock:
-            # if current_cache_size >= self.capacity, remove LRU and then insert
-            if key not in self.cache:
-                if self.current_cache_size >= self.capacity: #remove LRU
-                    node_to_evict = self.tail.prev
-                    del self.cache[node_to_evict.key]
-                    del self.ttl_map[key]
-                    self.current_cache_size -= 1
 
-                # insert
-                node = Node(key, value)
-                self._insert(node)
-                self.current_cache_size += 1
-                self.cache[key] = node
-                if ttl:
-                    self.ttl_map[key] = time.time() + ttl
-                logger.info(f"[{node}] SET key='{key}' ttl={ttl}")
-            # update
-            else:
-                node = self.cache.get(key)
+        # Start the cleaner only after all state exists.
+        threading.Thread(target=self._cleaner, daemon=True).start()
+
+    # ---------- public API ----------
+
+    def set(self, key, value, ttl=None):
+        """Insert or update a key. ttl in seconds; None or 0 means no expiry."""
+        with self.lock:
+            if key in self.cache:
+                node = self.cache[key]
                 node.value = value
                 self._remove(node)
                 self._insert(node)
-            
+            else:
+                if len(self.cache) >= self.capacity:
+                    lru = self.tail.prev
+                    self._delete_unlocked(lru.key)
+                    logger.info(f"EVICT key='{lru.key}' (LRU, capacity={self.capacity})")
+                node = Node(key, value)
+                self._insert(node)
+                self.cache[key] = node
+
+            # Every write resets the TTL; a write without TTL clears it.
+            if ttl:
+                self.ttl_map[key] = time.time() + ttl
+            else:
+                self.ttl_map.pop(key, None)
+            logger.info(f"SET key='{key}' ttl={ttl}")
 
     def get(self, key):
-        # only one thread at a time can execute any code inside this block
+        """Return the value, or None if missing or expired. Marks key as MRU."""
         with self.lock:
-            if key not in self.cache: 
-                return None
-            # if key is expired, remove it from cache
-            if key in self.ttl_map and time.time() > self.ttl_map[key]:
-                print(self.ttl_map)
-                self.delete(key)
-                return None
             node = self.cache.get(key)
+            if node is None:
+                return None
+            if self._is_expired(key, time.time()):
+                self._delete_unlocked(key)
+                return None
             self._remove(node)
             self._insert(node)
             return node.value
 
     def delete(self, key):
-        if key in self.cache:
-            node = self.cache[key] # get key from cache
-            self._remove(node) # call remove to remove links
-            del self.cache[key] # remove from cache dict
-            del self.ttl_map[key] # remove key from ttl_map dict
-            self.current_cache_size -= 1 # reduce size since its complete delete
+        """Remove a key. Returns True if it existed."""
+        with self.lock:
+            return self._delete_unlocked(key)
+
+    def __len__(self):
+        with self.lock:
+            return len(self.cache)
+
+    # ---------- internals (caller holds self.lock) ----------
+
+    def _is_expired(self, key, now):
+        expiry = self.ttl_map.get(key)
+        return expiry is not None and now > expiry
+
+    def _delete_unlocked(self, key):
+        node = self.cache.pop(key, None)
+        if node is None:
+            return False
+        self._remove(node)
+        self.ttl_map.pop(key, None)
+        return True
 
     def _remove(self, node):
-        """
-        Helper method to remove a node
-        and link its previous and next pointer to point each other.
-        called when a node is to be made MRU or while evicting keys after its expiry
-        """
+        """Unlink a node from the list."""
         node.prev.next = node.next
         node.next.prev = node.prev
-    
+        node.prev = node.next = None
+
     def _insert(self, node):
-        """
-        Helper method to insert a node at front
-        and make head point to it
-        """
+        """Insert a node right after head (most recently used position)."""
         node.next = self.head.next
-        node.next.prev = node
-        self.head.next = node
         node.prev = self.head
+        self.head.next.prev = node
+        self.head.next = node
 
     def _cleaner(self):
-        """
-        Helper method to delete expired keys using a worker thread
-        """
-        logger.info("Running cleaner job to expire expired keys.")
+        """Background thread: remove expired keys periodically."""
+        logger.info("TTL cleaner started")
         while True:
-            time.sleep(1)
+            time.sleep(self.cleanup_interval)
             now = time.time()
             with self.lock:
-                expired_keys = [key for key, ttl in self.ttl_map.items() if now > ttl]
-                for key in expired_keys:
-                    self.delete(key)
-                    logger.info(f"KeyExpired at: {now}, removed from cache: {key}")
+                expired = [k for k, exp in self.ttl_map.items() if now > exp]
+                for key in expired:
+                    self._delete_unlocked(key)
+            for key in expired:
+                logger.info(f"EXPIRE key='{key}'")
